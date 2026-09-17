@@ -1,0 +1,3 @@
+ursina>=7.0
+panda3d
+pillow

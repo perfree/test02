@@ -1,1317 +1,886 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-agv_sim.py — 现代化智能仓储 AGV 3D 路径规划仿真 (Ursina + Panda3D)
+3D 智能仓储 AGV 路径规划仿真  (Ursina / Panda3D)
 
 真实算法：
-  * 栅格 A* 寻路（八邻域 + octile 启发式 + 禁止穿墙角 + 障碍膨胀）
-  * 视线（LOS）直线段路径平滑
-  * 纯追踪 (pure pursuit) 差速运动学，真实角速度/线速度控制
-  * 行进中周期性校验路径，被新增障碍阻断即自动重规划
-  * 新增障碍后做连通性校验，会封死路径则回滚
+  - 障碍栅格化（按机器人外接半径膨胀）+ 8 邻接 A* + 视线平滑  —— planner.py
+  - 鼠标增删障碍 / 重设目标点后，实时重建栅格并重新规划
+  - 运行中持续对前方路径做碰撞采样，被新障碍阻断即自动重规划
+  - 差速底盘运动学：限速、线加速度、最大角速度、车轮按 v/r 真实滚动
+没有任何固定路线或预设动画。
 
-交互：
-  鼠标左键           当前模式下点击（目标 / 添加障碍 / 删除障碍，支持拖拽）
-  鼠标右键拖拽       环绕视角；滚轮 缩放
-  1/2/3/4 或按钮     切换模式：目标 / 货架 / 集装箱混合 / 删除
-  F                  添加模式下旋转障碍朝向
-  空格               暂停 / 继续；R 重新开始；N 随机新场景
+操作：
+  左键          依当前模式：设置目标点 / 添加障碍 / 删除障碍
+  Tab / 1/2/3   切换 目标/添加/删除 模式
+  Q             切换添加的障碍类型（货架/集装箱/围栏/设备箱）
+  空格          暂停 / 继续； R 重新开始； N 随机场景； Esc 退出
+  鼠标右键拖动  旋转视角； 滚轮 缩放； 中键 平移
 
-  python3 agv_sim.py            正常运行
-  python3 agv_sim.py --selftest 无头自检（随机场景 + A* + 模拟编辑，不弹窗）
-  python3 agv_sim.py --smoke    弹窗冒烟测试（约 10 秒后自动退出）
+无窗口自测： AGV_SMOKE=1 python3 agv_sim.py
 """
 
-import sys
-import os
+from __future__ import annotations
+
 import math
+import os
 import random
-import heapq
-from collections import deque
-from PIL import Image, ImageDraw
+import sys
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
-from ursina import (Entity, Ursina, color, Vec3, mouse, BoxCollider,
-                    DirectionalLight, Cylinder, Text, Button, window,
-                    held_keys, destroy, application, clamp, time as u_time,
-                    camera)
+from panda3d.core import loadPrcFileData
 
-# ----------------------------------------------------------------------
-# 配置
-# ----------------------------------------------------------------------
-GRID_W, GRID_H = 40, 30                 # 栅格数（每格 1m × 1m）
-INFLATE = 1                             # 障碍膨胀格数（底盘安全余量）
-ROBOT_SPEED = 2.4                       # m/s
-ROBOT_OMEGA = 200.0                     # 最大角速度 度/秒
-LOOKAHEAD = 1.0                         # 纯追踪前视距离 (m)
-ARRIVE_DIST = 0.30
-PATH_CHECK_INTERVAL = 0.4
-TRAIL_SPACING = 0.14
-TRAIL_MAX = 700
+# ---- 窗口配置（必须在 import ursina 之前） ----
+if os.environ.get('AGV_SMOKE'):
+    loadPrcFileData('', 'window-type offscreen')
+loadPrcFileData('', 'window-title 智能仓储 AGV 路径规划仿真')
+loadPrcFileData('', 'framebuffer-multisample 1')
+loadPrcFileData('', 'multisamples 4')
 
-START_CELL = (3, GRID_H // 2)
-GOAL_CELL = (GRID_W - 4, GRID_H // 2)
+from ursina import (  # noqa: E402
+    Ursina, Entity, EditorCamera, DirectionalLight, AmbientLight,
+    Button, Text, color, Vec2, application,
+    mouse, destroy, window, camera, clamp, Cylinder,
+)
+from ursina import time as u_time  # noqa: E402
 
-OB_TYPES = {
-    'rack':      dict(name='货架',   footprint=(1, 3)),
-    'container': dict(name='集装箱', footprint=(2, 1)),
-    'equip':     dict(name='设备箱', footprint=(1, 1)),
-    'fence':     dict(name='围栏',   footprint=(4, 1)),
+from planner import GridWorld, BoxObstacle, plan_path, path_length  # noqa: E402
+
+# ============================== 参数 ==============================
+ARENA_W, ARENA_D = 40.0, 30.0
+CELL = 0.5
+ROBOT_RADIUS = 0.45
+MAX_SPEED = 3.2          # m/s
+MAX_ANGULAR = 120.0      # deg/s
+ACCEL = 2.4              # m/s^2
+STOP_TOL = 0.55          # m（需大于中间路径点消费半径）
+WP_TOL = 0.35            # m，中间路径点消费半径
+
+START_POS = (-17.0, -11.0)
+INIT_GOAL = (16.0, 11.0)
+
+MODE_TARGET = '目标点'
+MODE_ADD = '添加障碍'
+MODE_DELETE = '删除障碍'
+
+OB_KINDS = {
+    '货架':   dict(w=3.2, d=1.1, h=3.6),
+    '集装箱': dict(w=4.6, d=2.3, h=2.4),
+    '围栏':   dict(w=3.6, d=0.35, h=1.05),
+    '设备箱': dict(w=1.6, d=1.4, h=1.9),
 }
+KIND_ORDER = list(OB_KINDS)
 
-CJK_FONT_CANDIDATES = [
-    '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
-    '/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc',
-]
-
-_CJK_FONT = None
-
-def cjk_font():
-    """Ursina 的 Text.font 只认 ttf/otf 路径（不认 ttc），
-    这里用 Panda3D DynamicTextFont 直接加载 Noto CJK ttc 后注入。"""
-    global _CJK_FONT
-    if _CJK_FONT is not None:
-        return _CJK_FONT
-    from panda3d.core import DynamicTextFont
-    for p in CJK_FONT_CANDIDATES:
-        if os.path.exists(p):
-            _CJK_FONT = DynamicTextFont(p)
-            return _CJK_FONT
-    return None
-
-def apply_cjk(text_entity, content=None):
-    f = cjk_font()
-    if f is not None:
-        text_entity._font = f
-        if content is not None:
-            text_entity.text = content
-    return text_entity
-
-# ----------------------------------------------------------------------
-# 过程化纹理
-# ----------------------------------------------------------------------
-def make_grid_texture():
-    """浅灰仓储地面：浅灰底 + 细网格 + 每 5 格粗线。"""
-    from ursina import Texture
-    cell = 48
-    img = Image.new('RGB', (GRID_W * cell, GRID_H * cell), (228, 231, 235))
-    d = ImageDraw.Draw(img)
-    fine = (206, 210, 216)
-    bold = (180, 186, 194)
-    W, H = GRID_W * cell, GRID_H * cell
-    for i in range(GRID_W + 1):
-        x = i * cell
-        d.line([(x, 0), (x, H)], fill=bold if i % 5 == 0 else fine,
-               width=3 if i % 5 == 0 else 1)
-    for j in range(GRID_H + 1):
-        y = j * cell
-        d.line([(0, y), (W, y)], fill=bold if j % 5 == 0 else fine,
-               width=3 if j % 5 == 0 else 1)
-    t = Texture(img)
-    t.filtering = None
-    return t
+C_SHELF = color.rgb32(70, 92, 130)
+C_CONTAINER = color.rgb32(150, 102, 58)
+C_FENCE = color.rgb32(214, 176, 52)
+C_BOX = color.rgb32(96, 130, 116)
 
 
-# ----------------------------------------------------------------------
-# 规划器：膨胀占据栅格 + A* + LOS 平滑
-# ----------------------------------------------------------------------
-class GridPlanner:
-    def __init__(self, w=GRID_W, h=GRID_H, inflate=INFLATE):
-        self.w, self.h = w, h
-        self.inflate = inflate
-        self.base = [[False] * h for _ in range(w)]
-        self.blocked = [[True] * h for _ in range(w)]
-        self._rebuild_inflation()
+@dataclass
+class Obstacle:
+    name: str
+    box: BoxObstacle
+    entity: Entity
 
-    def in_bounds(self, x, z):
-        return 0 <= x < self.w and 0 <= z < self.h
 
-    def add_base_cells(self, cells):
-        for (x, z) in cells:
-            if self.in_bounds(x, z):
-                self.base[x][z] = True
-        self._rebuild_inflation()
+class AGVSimulation:
+    def __init__(self) -> None:
+        self.app = Ursina(borderless=False)
+        window.color = color.rgb32(226, 230, 236)
+        window.fps_counter.enabled = False
+        try:
+            Text.default_font = 'cjk.otf'
+        except Exception:
+            pass
 
-    def remove_base_cells(self, cells):
-        for (x, z) in cells:
-            if self.in_bounds(x, z):
-                self.base[x][z] = False
-        self._rebuild_inflation()
+        # ---- 灯光 ----
+        dlight = DirectionalLight(shadows=True,
+                                  color=color.rgb32(225, 228, 235),
+                                  position=(10, 34, -16))
+        dlight.look_at((0, 0, 0))
+        AmbientLight(color=color.rgba32(150, 155, 165, 255))
 
-    def _rebuild_inflation(self):
-        r, w, h = self.inflate, self.w, self.h
-        for x in range(w):
-            col = self.blocked[x]
-            for z in range(h):
-                blocked = False
-                x0, x1 = max(0, x - r), min(w, x + r + 1)
-                z0, z1 = max(0, z - r), min(h, z + r + 1)
-                for nx in range(x0, x1):
-                    ncol = self.base[nx]
-                    for nz in range(z0, z1):
-                        if ncol[nz]:
-                            blocked = True
-                            break
-                    if blocked:
-                        break
-                col[z] = blocked
+        # ---- 地面与围栏边界 ----
+        self._build_floor()
 
-    def cell_free(self, cell):
-        x, z = cell
-        return self.in_bounds(x, z) and not self.blocked[x][z]
+        # ---- 规划世界 ----
+        self.world = GridWorld(ARENA_W, ARENA_D, CELL, inflation=0.5)
+        self.obstacles: List[Obstacle] = []
+
+        # ---- 机器人与标记 ----
+        self.robot = self._build_robot()
+        self.goal_pos: Optional[Vec2] = None
+        self.goal_marker = self._build_goal_marker()
+        self.path: List[Tuple[float, float]] = []
+        self.path_entities: List[Entity] = []
+        self.trail: List[Tuple[float, float]] = []
+        self.trail_entities: List[Entity] = []
+
+        # 运动状态
+        self.speed = 0.0
+        self.heading = 0.0
+        self.paused = False
+        self.status = '待机'
+        self.replan_count = 0
+        self.block_cd = 0.0
+
+        # 交互
+        self.mode = MODE_TARGET
+        self.add_kind = KIND_ORDER[0]
+        self.hover_point: Optional[Tuple[float, float]] = None
+        self.ghost = Entity(model='cube', enabled=False, unlit=True,
+                            origin_y=-0.5)
+
+        # ---- 初始场景 ----
+        self._build_initial_scene()
+        self.rerasterize()
+        self.clear_trail()
+        self.set_goal(Vec2(*INIT_GOAL), count_replan=False)
+
+        # ---- UI / 相机 ----
+        # UI 延迟到首帧 aspect_ratio 稳定后再构建，避免被窗口的
+        # 宽高比自动修正逻辑多次缩放坐标
+        self._ui_ready = False
+        self.hud = None
+        self.kind_text = None
+        self.mode_buttons = {}
+        self.editor = EditorCamera(rotation=(55, -28, 0),
+                                   position=(0, 26, -20), fov=60)
+
+    # ========================== 场景 ==========================
+    def _build_floor(self) -> None:
+        tex_path = self._make_grid_texture()
+        ground = Entity(model='plane', scale=(ARENA_W, 1, ARENA_D),
+                        texture=tex_path,
+                        texture_scale=(ARENA_W / 2.0, ARENA_D / 2.0),
+                        color=color.rgb32(232, 234, 238), collider='box')
+        ground.is_ground = True
+        self.ground = ground
+        # 场地边框
+        for w_, d_, px, pz in (
+            (ARENA_W + 2, 0.4, 0, -ARENA_D / 2 - 0.2),
+            (ARENA_W + 2, 0.4, 0, ARENA_D / 2 + 0.2),
+            (0.4, ARENA_D + 2, -ARENA_W / 2 - 0.2, 0),
+            (0.4, ARENA_D + 2, ARENA_W / 2 + 0.2, 0),
+        ):
+            Entity(model='cube', scale=(w_, 0.12, d_),
+                   position=(px, 0.06, pz),
+                   color=color.rgb32(170, 178, 190))
 
     @staticmethod
-    def cell_to_world(cell):
-        return Vec3(cell[0] - GRID_W / 2 + 0.5, 0, cell[1] - GRID_H / 2 + 0.5)
+    def _make_grid_texture() -> str:
+        from PIL import Image
+        s = 64
+        img = Image.new('RGBA', (s, s), (236, 238, 242, 255))
+        p = img.load()
+        for i in range(s):
+            p[i, 0] = (196, 200, 208, 255)
+            p[0, i] = (196, 200, 208, 255)
+            p[i, 1] = (214, 217, 223, 255)
+            p[1, i] = (214, 217, 223, 255)
+        path = str(application.asset_folder / '_grid_floor.png')
+        img.save(path)
+        return path
 
-    @staticmethod
-    def world_to_cell(pos):
-        return (int(math.floor(pos.x + GRID_W / 2)),
-                int(math.floor(pos.z + GRID_H / 2)))
+    def _make_obstacle_entity(self, name: str, x: float, z: float) -> Entity:
+        if name == '货架':
+            root = Entity(position=(x, 0, z))
+            k = OB_KINDS['货架']
+            for ox in (-k['w'] / 4, k['w'] / 4):
+                for oz in (-k['d'] / 2 + 0.12, k['d'] / 2 - 0.12):
+                    Entity(parent=root, model='cube',
+                           scale=(0.14, k['h'], 0.14),
+                           position=(ox, k['h'] / 2, oz),
+                           color=color.rgb32(46, 58, 84), collider='box')
+            for lev in (0.9, 1.9, 2.9):
+                Entity(parent=root, model='cube',
+                       scale=(k['w'], 0.12, k['d']),
+                       position=(0, lev, 0),
+                       color=color.rgb32(82, 106, 148), collider='box')
+            Entity(parent=root, model='cube',
+                   scale=(k['w'], 0.1, k['d']),
+                   position=(0, k['h'], 0), color=C_SHELF)
+            return root
 
-    def clamp_goal(self, cell):
-        """若目标格被占，BFS 找最近的空闲格。"""
-        if self.cell_free(cell):
-            return cell
-        q = deque([cell])
-        seen = {cell}
-        while q:
-            c = q.popleft()
-            if self.cell_free(c):
-                return c
-            for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                n = (c[0] + dx, c[1] + dz)
-                if self.in_bounds(*n) and n not in seen:
-                    seen.add(n)
-                    q.append(n)
+        if name == '围栏':
+            root = Entity(position=(x, 0, z))
+            k = OB_KINDS['围栏']
+            Entity(parent=root, model='cube',
+                   scale=(k['w'], 0.08, 0.08),
+                   position=(0, 0.55, 0), color=C_FENCE, collider='box')
+            Entity(parent=root, model='cube',
+                   scale=(k['w'], 0.08, 0.08),
+                   position=(0, 0.95, 0), color=C_FENCE, collider='box')
+            for ox in (-k['w'] / 2, k['w'] / 2):
+                for oz in (-0.12, 0.12):
+                    Entity(parent=root, model='cube',
+                           scale=(0.1, 1.05, 0.1),
+                           position=(ox, 0.52, oz),
+                           color=color.rgb32(180, 140, 40), collider='box')
+            return root
+
+        k = OB_KINDS[name]
+        c = C_CONTAINER if name == '集装箱' else C_BOX
+        # 根实体不缩放；所有子件用真实尺寸，避免嵌套缩放累乘
+        root = Entity(position=(x, 0, z))
+        Entity(parent=root, model='cube',
+               scale=(k['w'], k['h'], k['d']),
+               position=(0, k['h'] / 2, 0), color=c, collider='box')
+        if name == '集装箱':
+            for fy in (-0.55, 0, 0.55):   # 相对箱体高度 -0.5..0.5
+                Entity(parent=root, model='cube',
+                       scale=(k['w'] * 1.02, 0.12, k['d'] * 1.02),
+                       position=(0, k['h'] * (0.5 + fy), 0),
+                       color=color.rgb32(118, 78, 44))
+        else:
+            # 前面板
+            Entity(parent=root, model='cube',
+                   scale=(k['w'] * 0.5, k['h'] * 0.32, 0.08),
+                   position=(0, k['h'] * 0.35, k['d'] / 2 + 0.005),
+                   color=color.rgb32(30, 34, 40))
+            # 中部腰线
+            Entity(parent=root, model='cube',
+                   scale=(k['w'] * 1.02, 0.10, k['d'] * 1.02),
+                   position=(0, k['h'] * 0.65, 0),
+                   color=color.rgb32(70, 96, 86))
+        return root
+
+    def add_obstacle(self, name: str, x: float, z: float,
+                     silent: bool = False) -> bool:
+        k = OB_KINDS[name]
+        if not self._can_place(x, z, k['w'], k['d']):
+            return False
+        ent = self._make_obstacle_entity(name, x, z)
+        self.obstacles.append(Obstacle(name, BoxObstacle(x, z, k['w'], k['d']),
+                                       ent))
+        if not silent:
+            self.rerasterize()
+            if self.goal_pos is not None:
+                self.do_replan()
+        return True
+
+    def remove_obstacle(self, root: Entity) -> bool:
+        for i, ob in enumerate(self.obstacles):
+            if ob.entity == root:
+                destroy(ob.entity)
+                del self.obstacles[i]
+                self.rerasterize()
+                if self.goal_pos is not None:
+                    self.do_replan()
+                return True
+        return False
+
+    def _can_place(self, x: float, z: float, w: float, d: float) -> bool:
+        if abs(x) + w / 2 > ARENA_W / 2 - 0.6 or \
+           abs(z) + d / 2 > ARENA_D / 2 - 0.6:
+            return False
+        for ob in self.obstacles:
+            if (abs(x - ob.box.x) < (w + ob.box.w) / 2 + 0.15 and
+                    abs(z - ob.box.z) < (d + ob.box.d) / 2 + 0.15):
+                return False
+        # 不得让障碍的膨胀栅格覆盖机器人脚下位置：
+        # 保留 膨胀半径 + 一个栅格的量化余量
+        clear = self.world.inflation + self.world.cell
+        if abs(x - self.robot.x) < w / 2 + clear and \
+           abs(z - self.robot.z) < d / 2 + clear:
+            return False
+        return True
+
+    def _build_initial_scene(self) -> None:
+        layout = [
+            ('货架', -4, 2.0), ('货架', 1.0, 2.0), ('货架', 6.0, 2.0),
+            ('货架', -1.5, 8.5), ('货架', 3.5, 8.5),
+            ('集装箱', 9.5, -6.5), ('集装箱', -8.5, -5.5),
+            ('围栏', -2.0, -4.0), ('围栏', 4.0, -8.5),
+            ('设备箱', 11.5, 6.5), ('设备箱', -11.0, 7.0),
+            ('设备箱', 7.5, 12.0),
+        ]
+        for name, x, z in layout:
+            self.add_obstacle(name, float(x), float(z), silent=True)
+
+    def random_scene(self) -> None:
+        for ob in self.obstacles:
+            destroy(ob.entity)
+        self.obstacles.clear()
+        rng = random.Random()
+        target = rng.randint(14, 21)
+        attempts = 0
+        placed = 0
+        reserved = (START_POS, INIT_GOAL)
+        while placed < target and attempts < 800:
+            attempts += 1
+            name = rng.choices(KIND_ORDER, weights=(4, 2, 2, 2))[0]
+            x = round(rng.uniform(-ARENA_W / 2 + 3, ARENA_W / 2 - 3), 1)
+            z = round(rng.uniform(-ARENA_D / 2 + 3, ARENA_D / 2 - 3), 1)
+            if any(math.hypot(x - rx, z - rz) < 4.5 for rx, rz in reserved):
+                continue
+            if self.add_obstacle(name, x, z, silent=True):
+                placed += 1
+        self.rerasterize()
+        # 极端情况下起终点不通则随机再来一次
+        test, _ = plan_path(self.world, START_POS, INIT_GOAL)
+        if test is None:
+            return self.random_scene()
+        self.reset_robot(keep_goal=False)
+        self.set_goal(Vec2(*INIT_GOAL), count_replan=False)
+
+    def rerasterize(self) -> None:
+        self.world.rasterize(ob.box for ob in self.obstacles)
+
+    # ========================== 机器人 ==========================
+    def _build_robot(self) -> Entity:
+        root = Entity(position=(START_POS[0], 0, START_POS[1]))
+        # 低矮底盘 + 上车体
+        Entity(parent=root, model='cube', scale=(0.95, 0.22, 1.25),
+               position=(0, 0.28, 0), color=color.rgb32(224, 158, 28))
+        Entity(parent=root, model='cube', scale=(0.78, 0.20, 0.95),
+               position=(0, 0.47, 0), color=color.rgb32(38, 44, 54))
+        # 激光雷达转台（持续旋转）
+        self.turret = Entity(parent=root, position=(0, 0.64, 0))
+        Entity(parent=self.turret, model=Cylinder(resolution=16, start=-.5),
+               scale=(0.30, 0.16, 0.30), color=color.rgb32(20, 24, 30))
+        Entity(parent=self.turret, model='cube',
+               scale=(0.07, 0.10, 0.34), position=(0, 0.07, 0.16),
+               color=color.rgb32(40, 220, 220))
+        Entity(parent=root, model=Cylinder(resolution=16, start=-.5), scale=(0.16, 0.10, 0.16),
+               position=(0, 0.80, 0), color=color.rgb32(60, 70, 84))
+        # 状态灯
+        self.status_light = Entity(parent=root, model='sphere',
+                                   scale=0.16, position=(0, 0.66, -0.36),
+                                   color=color.cyan, unlit=True)
+        # 四个可见车轮：枢轴（滚动角）-> 轮体（cylinder 默认轴向 Y，绕 Z 转 90°
+        # 使车轴指向车体 X），枢轴绕 X 旋转即为车轮绕车轴真实滚动
+        self.wheels = []
+        for ox, oz in ((-0.52, 0.42), (0.52, 0.42),
+                       (-0.52, -0.42), (0.52, -0.42)):
+            pivot = Entity(parent=root, position=(ox, 0.20, oz))
+            Entity(parent=pivot, model=Cylinder(resolution=16, start=-.5),
+                   rotation=(0, 0, 90), scale=(0.40, 0.13, 0.40),
+                   color=color.rgb32(28, 30, 34))
+            self.wheels.append(pivot)
+        # 前部车灯
+        Entity(parent=root, model='cube', scale=(0.30, 0.06, 0.08),
+               position=(0, 0.52, 0.60), color=color.rgb32(255, 240, 180))
+        return root
+
+    def _build_goal_marker(self) -> Entity:
+        g = Entity(enabled=False)
+        Entity(parent=g, model=Cylinder(resolution=16, start=-.5), scale=(0.05, 2.4, 0.05),
+               position=(0, 1.2, 0), color=color.rgba32(80, 200, 120, 160))
+        self.goal_ring = Entity(parent=g, model=Cylinder(resolution=16, start=-.5),
+                                scale=(0.75, 0.05, 0.75),
+                                position=(0, 0.05, 0),
+                                color=color.rgba32(60, 220, 130, 150))
+        self.goal_beacon = Entity(parent=g, model='sphere', scale=0.28,
+                                  position=(0, 2.45, 0),
+                                  color=color.rgb32(60, 220, 130), unlit=True)
+        return g
+
+    # ========================== 路径可视化 ==========================
+    def clear_path_viz(self) -> None:
+        for e in self.path_entities:
+            destroy(e)
+        self.path_entities = []
+
+    def render_path(self) -> None:
+        self.clear_path_viz()
+        if len(self.path) < 2:
+            return
+        for a, b in zip(self.path, self.path[1:]):
+            seg_len = math.hypot(b[0] - a[0], b[1] - a[1])
+            yaw = math.degrees(math.atan2(b[0] - a[0], b[1] - a[1]))
+            e = Entity(model='cube',
+                       scale=(0.12, 0.03, max(seg_len, 0.02)),
+                       position=((a[0] + b[0]) / 2, 0.07, (a[1] + b[1]) / 2),
+                       rotation=(0, yaw, 0),
+                       color=color.rgb32(40, 170, 255), unlit=True)
+            self.path_entities.append(e)
+        for x, z in self.path:
+            e = Entity(model='sphere', scale=0.13, position=(x, 0.1, z),
+                       color=color.rgb32(120, 210, 255), unlit=True)
+            self.path_entities.append(e)
+
+    def add_trail_point(self, p: Tuple[float, float]) -> None:
+        self.trail.append(p)
+        e = Entity(model='cube', scale=(0.16, 0.04, 0.16),
+                   position=(p[0], 0.03, p[1]),
+                   color=color.rgb32(255, 80, 200), unlit=True)
+        self.trail_entities.append(e)
+
+    def clear_trail(self) -> None:
+        for e in self.trail_entities:
+            destroy(e)
+        self.trail_entities = []
+        self.trail = []
+
+    # ========================== 规划 ==========================
+    def set_goal(self, p: Vec2, count_replan: bool = False) -> None:
+        self.goal_pos = Vec2(float(p.x), float(p.y))
+        self.goal_marker.enabled = True
+        self.goal_marker.position = (p.x, 0, p.y)
+        self.clear_trail()
+        self._recompute(count_replan=count_replan)
+
+    def do_replan(self) -> None:
+        self._recompute(count_replan=True)
+
+    def _recompute(self, count_replan: bool) -> bool:
+        if self.goal_pos is None:
+            self.path = []
+            self.render_path()
+            return False
+        new_path, _ = plan_path(
+            self.world,
+            (self.robot.x, self.robot.z),
+            (self.goal_pos.x, self.goal_pos.y))
+        if new_path is None:
+            self.path = []
+            self.status = '无可行路径'
+            self.render_path()
+            return False
+        gx, gz = new_path[-1]
+        # BFS 吸附：目标点实际被移动到最近可达点时同步标记
+        if math.hypot(gx - self.goal_pos.x, gz - self.goal_pos.y) > 0.3:
+            self.goal_pos = Vec2(gx, gz)
+            self.goal_marker.position = (gx, 0, gz)
+        self.path = new_path
+        if count_replan:
+            self.replan_count += 1
+        self.render_path()
+        return True
+
+    def remaining_distance(self) -> float:
+        if not self.path:
+            return 0.0
+        d = math.hypot(self.robot.x - self.path[0][0],
+                       self.robot.z - self.path[0][1])
+        return d + path_length(self.path)
+
+    # ========================== 交互 ==========================
+    def _ui_hovered(self) -> bool:
+        e = mouse.hovered_entity
+        while e is not None:
+            if getattr(e, '_is_ui', False):
+                return True
+            e = e.parent
+        return False
+
+    def _world_hover(self) -> Optional[Tuple[float, float]]:
+        """返回鼠标所指的地面世界坐标（x,z）。"""
+        if self._ui_hovered():
+            return None
+        wp = mouse.world_point
+        if wp is None:
+            return None
+        return float(wp.x), float(wp.z)
+
+    def _obstacle_root_under_cursor(self) -> Optional[Entity]:
+        if self._ui_hovered():
+            return None
+        e = mouse.hovered_entity
+        roots = {ob.entity for ob in self.obstacles}
+        while e is not None:
+            if e in roots:
+                return e
+            e = e.parent
         return None
 
-    def astar(self, start, goal):
-        if not self.in_bounds(*start) or not self.in_bounds(*goal):
-            return []
-        if start == goal:
-            return [start]
-        if self.blocked[goal[0]][goal[1]]:
-            return []
-
-        D2 = math.sqrt(2.0)
-
-        def h(c):
-            dx, dz = abs(c[0] - goal[0]), abs(c[1] - goal[1])
-            return dx + dz + (D2 - 2) * min(dx, dz)
-
-        open_heap = [(h(start), 0.0, start)]
-        gscore = {start: 0.0}
-        parent = {}
-        closed = set()
-
-        while open_heap:
-            _, g, cur = heapq.heappop(open_heap)
-            if cur in closed:
-                continue
-            if cur == goal:
-                path = [cur]
-                while cur in parent:
-                    cur = parent[cur]
-                    path.append(cur)
-                path.reverse()
-                return path
-            closed.add(cur)
-            cx, cz = cur
-            for dx in (-1, 0, 1):
-                for dz in (-1, 0, 1):
-                    if dx == 0 and dz == 0:
-                        continue
-                    nx, nz = cx + dx, cz + dz
-                    if not self.in_bounds(nx, nz) or self.blocked[nx][nz]:
-                        continue
-                    if dx != 0 and dz != 0:
-                        if self.blocked[cx][nz] or self.blocked[nx][cz]:
-                            continue
-                    nb = (nx, nz)
-                    if nb in closed:
-                        continue
-                    step = D2 if dx and dz else 1.0
-                    ng = g + step
-                    if ng < gscore.get(nb, 1e18):
-                        gscore[nb] = ng
-                        parent[nb] = cur
-                        heapq.heappush(open_heap, (ng + h(nb), ng, nb))
-        return []
-
-    def segment_blocked(self, a, b, skip_start=0.0):
-        """世界坐标直线段是否与膨胀障碍相交（0.25m 采样）；
-        skip_start 内的近端点不检查（机器人转弯时可能短暂贴近膨胀格）。"""
-        dx, dz = b.x - a.x, b.z - a.z
-        dist = math.hypot(dx, dz)
-        if dist < 1e-6:
-            return False
-        steps = max(2, int(dist / 0.25))
-        for i in range(steps + 1):
-            t = i / steps
-            if t * dist < skip_start:
-                continue
-            cx = int(math.floor(a.x + dx * t + GRID_W / 2))
-            cz = int(math.floor(a.z + dz * t + GRID_H / 2))
-            if not self.in_bounds(cx, cz) or self.blocked[cx][cz]:
-                return True
-        return False
-
-    def smooth_path(self, wp):
-        if len(wp) <= 2:
-            return wp
-        out = [wp[0]]
-        i = 0
-        n = len(wp)
-        while i < n - 1:
-            j = n - 1
-            while j > i + 1:
-                if not self.segment_blocked(wp[i], wp[j]):
-                    break
-                j -= 1
-            out.append(wp[j])
-            i = j
-        return out
-
-    def plan_world(self, start_pos, goal_pos):
-        s = self.world_to_cell(start_pos)
-        g = self.clamp_goal(self.world_to_cell(goal_pos))
-        if g is None:
-            return []
-        cells = self.astar(s, g)
-        if not cells:
-            return []
-        wp = [self.cell_to_world(c) for c in cells]
-        wp[0] = Vec3(start_pos.x, 0, start_pos.z)
-        wp[-1] = Vec3(goal_pos.x, 0, goal_pos.z)
-        return self.smooth_path(wp)
-
-
-# ----------------------------------------------------------------------
-# 障碍工具
-# ----------------------------------------------------------------------
-def footprint_cells(cx, cz, nx, nz, rot):
-    if rot == 90:
-        nx, nz = nz, nx
-    x0 = cx - nx // 2
-    x1 = cx + (nx - 1) // 2
-    z0 = cz - nz // 2
-    z1 = cz + (nz - 1) // 2
-    return [(x, z) for x in range(x0, x1 + 1) for z in range(z0, z1 + 1)]
-
-
-def build_obstacle(kind, center, rot=0):
-    """返回带整体 box collider 的实体；细节都是子网格。"""
-    g = Entity(position=Vec3(center[0], 0, center[1]), rotation_y=rot)
-
-    if kind == 'rack':  # 横梁式货架 1×3，3 层货位
-        L, Wd, H = 2.7, 0.78, 2.6
-        rack_c = color.hsv(210, 0.18, 0.55)
-        beam_c = color.hsv(210, 0.28, 0.40)
-        for s in (-1, 1):
-            for sz in (-1, 1):
-                Entity(parent=g, model='cube', color=rack_c,
-                       position=(s * L / 2, 0.07, sz * Wd / 2),
-                       scale=(0.12, H, 0.12))
-        for lvl in (0.45, 1.35, 2.25):
-            for sz in (-1, 1):
-                Entity(parent=g, model='cube', color=beam_c,
-                       position=(0, lvl, sz * Wd / 2), scale=(L, 0.12, 0.12))
-            Entity(parent=g, model='cube', color=color.hsv(210, .1, .72),
-                   position=(0, lvl + 0.12, 0), scale=(L - 0.25, 0.07, Wd - 0.18))
-            for i, bx in enumerate((-0.85, 0.0, 0.85)):
-                cc = (color.azure, color.orange, color.lime)[i]
-                Entity(parent=g, model='cube', color=cc,
-                       position=(bx, lvl + 0.34, (i - 1) * 0.12),
-                       scale=(0.62, 0.36, 0.5))
-        g.collider = BoxCollider(g, size=(L, H, Wd), center=(0, H / 2, 0))
-
-    elif kind == 'container':  # 2×1 海运集装箱
-        L, Wd, H = 1.85, 1.7, 1.35
-        con_c = random.choice([color.hsv(24, .65, .62),
-                               color.hsv(15, .6, .55),
-                               color.hsv(190, .5, .5),
-                               color.hsv(95, .4, .45)])
-        Entity(parent=g, model='cube', color=con_c,
-               position=(0, H / 2, 0), scale=(L, H, Wd))
-        rib = color.hsv(0, 0, 0.35)
-        for xx in (-.75, -.45, -.15, .15, .45, .75):
-            for side in (-1, 1):
-                Entity(parent=g, model='cube', color=rib,
-                       position=(xx, H / 2, side * Wd / 2),
-                       scale=(0.05, H * .96, 0.04))
-        for yy in (.12, H - .12):
-            for side in (-1, 1):
-                Entity(parent=g, model='cube', color=rib,
-                       position=(0, yy, side * Wd / 2), scale=(L, .08, .05))
-        Entity(parent=g, model='cube', color=color.hsv(45, .25, .3),
-               position=(-L / 2 - .01, H / 2, 0), scale=(.05, H * .9, Wd * .9))
-        g.collider = BoxCollider(g, size=(L, H, Wd), center=(0, H / 2, 0))
-
-    elif kind == 'equip':  # 设备箱 / 充电桩 1×1
-        S, H = 0.8, 1.1
-        Entity(parent=g, model='cube', color=color.hsv(48, .35, .62),
-               position=(0, H / 2, 0), scale=(S, H, S))
-        Entity(parent=g, model='cube', color=color.hsv(48, .2, .8),
-               position=(0, H + 0.02, 0), scale=(S * 1.05, 0.05, S * 1.05))
-        for i in range(3):
-            Entity(parent=g, model='cube', color=color.hsv(0, 0, .25),
-                   position=(0, .35 + i * .14, S / 2 + .01),
-                   scale=(S * .55, .04, .03))
-        Entity(parent=g, model='sphere', color=color.red,
-               position=(S / 2 - .12, H - .15, S / 2 - .12), scale=0.1)
-        g.collider = BoxCollider(g, size=(S, H + .1, S), center=(0, (H + .1) / 2, 0))
-
-    elif kind == 'fence':  # 4×1 安全围栏
-        L, H = 3.8, 1.15
-        rail_c = color.hsv(212, .14, .62)
-        for s in (-1, 1):
-            for sz in (-1, 1):
-                Entity(parent=g, model=Cylinder(8), color=rail_c,
-                       position=(s * L / 2, H / 2, sz * .18),
-                       scale=(.05, H, .05))
-        for sz in (-1, 1):
-            for yy in (H * .35, H * .75):
-                Entity(parent=g, model='cube', color=rail_c,
-                       position=(0, yy, sz * .18), scale=(L, .05, .05))
-        Entity(parent=g, model='cube', color=color.hsv(45, .7, .55),
-               position=(0, .12, 0), scale=(L, .08, .42))
-        g.collider = BoxCollider(g, size=(L, 1.3, .46), center=(0, .65, 0))
-
-    return g
-
-
-# ----------------------------------------------------------------------
-# AGV 模型
-# ----------------------------------------------------------------------
-def build_robot():
-    root = Entity()
-    body_c = color.hsv(205, .42, .55)
-    dark = color.hsv(210, .25, .28)
-
-    Entity(parent=root, model='cube', color=dark,
-           position=(0, .22, 0), scale=(.92, .16, .66))
-    Entity(parent=root, model='cube', color=body_c,
-           position=(0, .37, 0), scale=(.76, .26, .54))
-    Entity(parent=root, model='cube', color=color.hsv(205, .2, .72),
-           position=(0, .52, 0), scale=(.6, .06, .42))
-    Entity(parent=root, model='cube', color=color.hsv(45, .7, .55),
-           position=(0, .3, .285), scale=(.5, .08, .03))
-
-    wheels = []
-    for sx in (-1, 1):
-        for sz in (-1, 1):
-            piv = Entity(parent=root, position=(sx * .33, .13, sz * .24))
-            w = Entity(parent=piv, model=Cylinder(20), rotation=(90, 0, 0),
-                       color=color.hsv(0, 0, .15), scale=(.145, .12, .145))
-            Entity(parent=piv, model=Cylinder(20), rotation=(90, 0, 0),
-                   color=color.hsv(0, 0, .75), scale=(.06, .13, .06))
-            wheels.append(w)
-
-    lidar = Entity(parent=root, position=(0, .56, 0))
-    Entity(parent=lidar, model=Cylinder(24), color=color.hsv(0, 0, .18),
-           scale=(.11, .09, .11))
-    scan_bar = Entity(parent=lidar, model='cube',
-                      color=color.rgba32(0, 220, 255, 130),
-                      position=(.1, .07, 0), scale=(.22, .02, .03))
-
-    beacon = Entity(parent=root, model='sphere', color=color.green,
-                    position=(-.22, .58, .16), scale=.085)
-    Entity(parent=root, model='sphere', color=color.rgba32(255, 240, 190, 255),
-           position=(.3, .39, .28), scale=.05)
-
-    root.wheels = wheels
-    root.scan_bar = scan_bar
-    root.beacon = beacon
-    return root
-
-
-# ----------------------------------------------------------------------
-# 主仿真（Entity：update/input 由 Ursina 自动回调）
-# ----------------------------------------------------------------------
-class AGVSimulation(Entity):
-    def __init__(self, smoke=False, shot=False):
-        super().__init__()
-        self.smoke = smoke
-        self.shot = shot
-        self.smoke_frames = 0
-        self.planner = GridPlanner()
-        self.obstacles = {}
-        self._next_ob_id = 1
-
-        self.mode = 'target'
-        self.add_kind = 'rack'
-        self.add_rot = 0
-        self.paused = False
-        self.replan_count = 0
-        self.odom = 0.0
-        self.message_text = ''
-        self.message_until = 0.0
-
-        self.start_pos = self.planner.cell_to_world(START_CELL)
-        self.goal_pos = self.planner.cell_to_world(GOAL_CELL)
-        self.robot_pos = Vec3(self.start_pos.x, 0, self.start_pos.z)
-        self.robot_heading = 0.0
-        self.robot_state = '规划中'
-        self.current_speed = 0.0
-        self.path = []
-        self._need_replan = False
-        self._check_acc = 0.0
-        self._paint_cd = 0.0
-        self._dragging = {'left': False, 'right': False}
-        self._left_down_pos = (0, 0)
-        self._left_moved = False
-
-        # ---- 场景 ----
-        self.floor = Entity(model='plane', texture=make_grid_texture(),
-                            scale=(GRID_W, 1, GRID_H), collider='box')
-        DirectionalLight(color=color.hsv(210, .12, .95), y=20, x=14, z=12,
-                         shadows=True, rotation=(50, -35, 35))
-        Entity(model='sphere', scale=400, color=color.hsv(212, .22, .92),
-               unlit=True)
-
-        self._build_perimeter_fence()
-        self.randomize_scene(initial=True)
-
-        self.robot = build_robot()
-        self.robot.position = self.robot_pos
-
-        self.goal_marker = self._make_goal_marker()
-        Entity(model='cube', color=color.rgba32(80, 230, 140, 160),
-               position=Vec3(self.start_pos.x, .015, self.start_pos.z),
-               scale=(.85, .02, .85))
-
-        # 路径 / 轨迹对象池
-        self.path_markers = [Entity(model='cube', enabled=False,
-                                    color=color.rgba32(0, 200, 255, 200),
-                                    scale=(.22, .03, .22))
-                             for _ in range(420)]
-        self.trail_markers = [Entity(model='cube', enabled=False,
-                                     color=color.rgba32(255, 150, 40, 220),
-                                     scale=(.12, .02, .12))
-                              for _ in range(TRAIL_MAX)]
-        self.trail_ring = deque(maxlen=TRAIL_MAX)
-        self._trail_acc = 0.0
-
-        # 放置预览（池）
-        self.preview = Entity(enabled=False, unlit=True)
-        self.preview_tiles = [Entity(parent=self.preview, model='cube',
-                                     unlit=True, enabled=False,
-                                     scale=(.96, .03, .96))
-                              for _ in range(16)]
-
-        # ---- 相机参数 ----
-        self._cam_dist = 25.0
-        self._orbit_yaw = 0.0
-        self._orbit_pitch = 50.0
-
-        # ---- UI ----
-        self.fkw = dict()
-        self._build_ui()
-
-        self._replan(count=False)
-        self.set_mode('target')
-        self.flash('点击地面设置新目标点；可用按钮添加/删除障碍')
-
-    # ---------------- 场景 ----------------
-    def _build_perimeter_fence(self):
-        rail_c = color.hsv(212, .14, .6)
-        hw, hh = GRID_W / 2, GRID_H / 2
-        for yy in (.45, .95):
-            Entity(model='cube', color=rail_c, position=(-.5, yy, -hh),
-                   scale=(GRID_W, .06, .06))
-            Entity(model='cube', color=rail_c, position=(-.5, yy, hh - 1),
-                   scale=(GRID_W, .06, .06))
-            Entity(model='cube', color=rail_c, position=(-hw, yy, -.5),
-                   scale=(.06, .06, GRID_H))
-            Entity(model='cube', color=rail_c, position=(hw - 1, yy, -.5),
-                   scale=(.06, .06, GRID_H))
-        for x in range(0, GRID_W, 2):
-            Entity(model=Cylinder(8), color=rail_c,
-                   position=Vec3(-hw + x, .6, -hh), scale=(.07, 1.25, .07))
-            Entity(model=Cylinder(8), color=rail_c,
-                   position=Vec3(-hw + x, .6, hh - 1), scale=(.07, 1.25, .07))
-        for z in range(0, GRID_H, 2):
-            Entity(model=Cylinder(8), color=rail_c,
-                   position=Vec3(-hw, .6, -hh + z), scale=(.07, 1.25, .07))
-            Entity(model=Cylinder(8), color=rail_c,
-                   position=Vec3(hw - 1, .6, -hh + z), scale=(.07, 1.25, .07))
-
-    def _make_goal_marker(self):
-        m = Entity(position=self.goal_pos)
-        Entity(parent=m, model=Cylinder(28), color=color.rgba32(255, 60, 60, 150),
-               scale=(.55, .04, .55), position=(0, .03, 0))
-        beam = Entity(parent=m, model=Cylinder(24),
-                      color=color.rgba32(255, 70, 70, 60),
-                      scale=(.12, 2.2, .12), position=(0, 1.1, 0))
-        m.beam = beam
-        return m
-
-    def _clear_obstacles(self):
-        for ob in self.obstacles.values():
-            destroy(ob['entity'])
-        self.obstacles.clear()
-        self._next_ob_id = 1
-        self.planner = GridPlanner()
-
-    def randomize_scene(self, initial=False):
-        if not initial:
-            self._clear_obstacles()
-            self.odom = 0.0
-            self.replan_count = 0
-            self.trail_ring.clear()
-            self._trail_acc = 0.0
-            for m in self.trail_markers:
-                m.enabled = False
-
-        def try_add(kind, cx, cz, rot):
-            nx, nz = OB_TYPES[kind]['footprint']
-            cells = footprint_cells(cx, cz, nx, nz, rot)
-            if any(not self.planner.in_bounds(x, z) for x, z in cells):
-                return False
-            if any(self.planner.base[x][z] for x, z in cells):
-                return False
-            self.planner.add_base_cells(cells)
-            if not self.planner.plan_world(self.start_pos, self.goal_pos):
-                self.planner.remove_base_cells(cells)
-                return False
-            center = (cx - GRID_W / 2 + .5, cz - GRID_H / 2 + .5)
-            ent = build_obstacle(kind, center, rot)
-            ent.ob_id = self._next_ob_id
-            self.obstacles[self._next_ob_id] = dict(kind=kind, cells=cells,
-                                                    entity=ent, rot=rot,
-                                                    center=(cx, cz))
-            self._next_ob_id += 1
-            return True
-
-        # 两排整齐货架，形成主巷道
-        for rz in (8, 21):
-            for cx in range(6, GRID_W - 6, 5):
-                try_add('rack', cx, rz + random.choice((-1, 0, 1)), 0)
-        for _ in range(4):
-            try_add('rack', random.randrange(5, GRID_W - 5),
-                    random.randrange(4, GRID_H - 4), random.choice((0, 90)))
-        for _ in range(7):
-            for _ in range(12):
-                if try_add('container', random.randrange(3, GRID_W - 3),
-                           random.randrange(3, GRID_H - 3),
-                           random.choice((0, 90))):
-                    break
-        for _ in range(9):
-            for _ in range(12):
-                if try_add('equip', random.randrange(2, GRID_W - 2),
-                           random.randrange(2, GRID_H - 2), 0):
-                    break
-        for _ in range(5):
-            for _ in range(15):
-                if try_add('fence', random.randrange(4, GRID_W - 4),
-                           random.randrange(3, GRID_H - 3),
-                           random.choice((0, 90))):
-                    break
-
-        if not initial:
-            self.robot_pos = Vec3(self.start_pos.x, 0, self.start_pos.z)
-            self.robot_heading = 0.0
-            self.robot.position = self.robot_pos
-            self.robot.rotation_y = 0
-            self.goal_pos = self.planner.cell_to_world(GOAL_CELL)
-            self.goal_marker.position = self.goal_pos
-            self.paused = False
-            self._replan(count=False)
-            self.flash('已随机生成新仓储场景')
-
-    # ---------------- 障碍编辑 ----------------
-    def add_obstacle_at(self, kind, cell, rot, quiet=False):
-        cx, cz = cell
-        nx, nz = OB_TYPES[kind]['footprint']
-        cells = footprint_cells(cx, cz, nx, nz, rot)
-        if any(not self.planner.in_bounds(x, z) for x, z in cells):
-            return False
-        if any(self.planner.base[x][z] for x, z in cells):
-            return False
-        protect = (self.planner.world_to_cell(self.robot_pos),
-                   self.planner.world_to_cell(self.start_pos),
-                   self.planner.world_to_cell(self.goal_pos))
-        if set(cells) & set(protect):
-            if not quiet:
-                self.flash('不能在机器人 / 起点 / 目标上放置障碍')
-            return False
-
-        self.planner.add_base_cells(cells)
-        new_path = self.planner.plan_world(self.robot_pos, self.goal_pos)
-        if not new_path:
-            self.planner.remove_base_cells(cells)
-            if not quiet:
-                self.flash('放置后无可达路径，已自动取消')
-            return False
-
-        center = (cx - GRID_W / 2 + .5, cz - GRID_H / 2 + .5)
-        ent = build_obstacle(kind, center, rot)
-        ent.ob_id = self._next_ob_id
-        self.obstacles[self._next_ob_id] = dict(kind=kind, cells=cells,
-                                                entity=ent, rot=rot,
-                                                center=(cx, cz))
-        self._next_ob_id += 1
-        self.path = new_path
-        self.replan_count += 1
-        self.refresh_path_markers()
-        if not quiet:
-            self.flash(f'已添加{OB_TYPES[kind]["name"]}，自动重新规划')
-        return True
-
-    def remove_obstacle(self, oid, quiet=False):
-        ob = self.obstacles.pop(oid, None)
-        if ob is None:
-            return False
-        self.planner.remove_base_cells(ob['cells'])
-        destroy(ob['entity'])
-        new_path = self.planner.plan_world(self.robot_pos, self.goal_pos)
-        if new_path:
-            self.path = new_path
-            self.replan_count += 1
-            self.refresh_path_markers()
-        if not quiet:
-            self.flash(f'已删除{OB_TYPES[ob["kind"]]["name"]}')
-        return True
-
-    def set_goal(self, world_pos):
-        cell = self.planner.world_to_cell(world_pos)
-        if not self.planner.in_bounds(*cell):
+    def _update_ghost(self) -> None:
+        if self.mode != MODE_ADD:
+            self.ghost.enabled = False
+            self.hover_point = None
             return
-        target = self.planner.clamp_goal(cell)
-        if target is None:
-            self.flash('附近没有可通行区域')
+        hp = self._world_hover()
+        if hp is None:
+            self.ghost.enabled = False
+            self.hover_point = None
             return
-        wp = self.planner.cell_to_world(target)
-        if math.hypot(wp.x - self.robot_pos.x, wp.z - self.robot_pos.z) < .8:
-            self.flash('目标点太靠近机器人')
-            return
-        self.goal_pos = wp
-        self.goal_marker.position = wp
-        self._replan()
-        self.flash('目标点已更新，重新规划路径')
+        x, z = hp
+        k = OB_KINDS[self.add_kind]
+        ok = self._can_place(x, z, k['w'], k['d'])
+        self.ghost.enabled = True
+        self.ghost.position = (x, 0.02, z)
+        self.ghost.scale = (k['w'], k['h'], k['d'])
+        self.ghost.color = (color.rgba32(60, 220, 130, 90) if ok
+                            else color.rgba32(235, 80, 80, 90))
+        self.hover_point = (x, z) if ok else None
 
-    # ---------------- 规划 ----------------
-    def _replan(self, count=True):
-        new_path = self.planner.plan_world(self.robot_pos, self.goal_pos)
-        if new_path:
-            self.path = new_path
-            if count:
-                self.replan_count += 1
-            self.refresh_path_markers()
-            self._need_replan = False
+    def on_click(self) -> None:
+        if self._ui_hovered():
+            return
+        if self.mode == MODE_TARGET:
+            # 只有点到空闲地面才重设目标
+            if mouse.hovered_entity is self.ground:
+                hp = self._world_hover()
+                if hp is not None:
+                    self.paused = False
+                    self.set_goal(Vec2(*hp), count_replan=False)
+        elif self.mode == MODE_ADD:
+            if self.hover_point is not None:
+                self.add_obstacle(self.add_kind, *self.hover_point)
+        else:  # MODE_DELETE
+            root = self._obstacle_root_under_cursor()
+            if root is not None:
+                self.remove_obstacle(root)
+
+    # ========================== 每帧仿真 ==========================
+    def update(self) -> None:
+        if not self._ui_ready:
+            self._build_ui()
+            self._ui_ready = True
+        dt = min(time_dt(), 0.05)
+        self._update_ghost()
+        self.turret.rotation_y += dt * 240
+        if self.goal_marker.enabled:
+            self.goal_ring.rotation_y += dt * 90
+            self.goal_beacon.y = 2.45 + 0.12 * math.sin(u_time.time() * 4)
+
+        if self.paused:
+            self.status = '暂停'
+            self._update_hud()
+            return
+        if self.goal_pos is None:
+            self.status = '待机'
+            self._update_hud()
+            return
+
+        dist_to_goal = math.hypot(self.robot.x - self.goal_pos.x,
+                                  self.robot.z - self.goal_pos.y)
+        if dist_to_goal < STOP_TOL:
+            self.speed = max(0.0, self.speed - ACCEL * 2.5 * dt)
+            if self.speed < 0.05:
+                self.speed = 0.0
+                self.status = '已到达'
+            self.robot.rotation_y = self.heading
+            self._roll_wheels(dt)
+            self._update_hud()
+            return
+
+        if not self.path:
+            self.speed = max(0.0, self.speed - ACCEL * 2.5 * dt)
+            self.status = '无可行路径'
+            self._update_hud()
+            return
+
+        # ---- 前方路径被新障碍阻断 -> 自动重新规划（带节流） ----
+        self.block_cd -= dt
+        if self._lookahead_blocked() and self.block_cd <= 0:
+            self.block_cd = 0.3
+            if self._recompute(count_replan=True):
+                self.status = '重新规划'
+            else:
+                self.status = '无可行路径'
+                self._update_hud()
+                return
+
+        # ---- 转向（大角度偏差时原地转向，避免带速挤进墙根） ----
+        tgt = self.path[0]
+        dx, dz = tgt[0] - self.robot.x, tgt[1] - self.robot.z
+        target_yaw = math.degrees(math.atan2(dx, dz))
+        diff = (target_yaw - self.heading + 180) % 360 - 180
+        self.heading += clamp(diff, -MAX_ANGULAR * dt, MAX_ANGULAR * dt)
+
+        # ---- 速度规划 ----
+        if abs(diff) > 40.0:
+            target_speed = 0.0                      # 原地掉头 / 转向
         else:
-            self._need_replan = True
-            self.path = []
-            self.refresh_path_markers()
-        return new_path
+            align = clamp(1.0 - (abs(diff) - 8.0) / 32.0, 0.25, 1.0) \
+                if abs(diff) > 8.0 else 1.0
+            target_speed = MAX_SPEED * align
+            remain = self.remaining_distance()
+            if remain < 2.2:
+                # 末段线性减速，允许趋近于 0，保证精确停在终点
+                target_speed = min(target_speed, remain * 1.6 + 0.05)
+        if self.speed < target_speed:
+            self.speed = min(target_speed, self.speed + ACCEL * dt)
+        else:
+            self.speed = max(target_speed, self.speed - ACCEL * 2.0 * dt)
 
-    def refresh_path_markers(self):
-        idx = 0
-        for wp in self.path[1:]:
-            if idx >= len(self.path_markers):
-                break
-            m = self.path_markers[idx]
-            m.enabled = True
-            m.position = Vec3(wp.x, .035, wp.z)
-            idx += 1
-        for m in self.path_markers[idx:]:
-            m.enabled = False
+        # ---- 位移积分（末级碰撞保险） ----
+        yaw_r = math.radians(self.heading)
+        step = self.speed * dt
+        nx = self.robot.x + math.sin(yaw_r) * step
+        nz = self.robot.z + math.cos(yaw_r) * step
+        if self.world.is_free_world(nx, nz):
+            self.robot.x, self.robot.z = nx, nz
+        else:
+            self.speed = 0.0
+            if self.block_cd <= 0:
+                self.block_cd = 0.3
+                if not self._recompute(count_replan=True):
+                    self.status = '无可行路径'
+        self.robot.rotation_y = self.heading
+        self._roll_wheels(dt)
 
-    def path_ahead_blocked(self):
-        """沿规划路径本身检查前方走廊是否被新增障碍阻断；
-        机器人偏离路径超过 0.7m（被新障碍挤离）也触发重规划。"""
-        if not self.path:
-            return True
-        best_seg, best_t, best_d2 = self._nearest_path_info()
-        # 偏离阈值留足切角余量；且刚重规划（投影点在路径起点）时不重复触发
-        if best_d2 > 1.0 ** 2:
-            return True
-        a, b = self.path[best_seg], self.path[best_seg + 1]
-        proj = Vec3(a.x + (b.x - a.x) * best_t, 0, a.z + (b.z - a.z) * best_t)
-        chain = [proj] + self.path[best_seg + 1:best_seg + 8]
-        for i in range(len(chain) - 1):
-            if self.planner.segment_blocked(chain[i], chain[i + 1]):
-                return True
-        return False
-
-    # ---------------- 运动学：纯追踪差速控制 ----------------
-    def update_robot(self, dt):
-        dist_goal = math.hypot(self.goal_pos.x - self.robot_pos.x,
-                               self.goal_pos.z - self.robot_pos.z)
-        if dist_goal < ARRIVE_DIST:
-            self.robot_state = '已到达'
-            self.current_speed = 0.0
-            return
-        if not self.path:
-            self.robot_state = '受阻·重规划中'
-            self.current_speed = 0.0
-            return
-
-        # ---- 标准纯追踪：投影到最近路径段，再沿路径取前视点 ----
-        seg_i, seg_t, dist2 = self._nearest_path_info()
-        # 已被抛在身后的航点弹出
-        while seg_i > 0 and self.path:
+        # ---- 消费路径点 ----
+        if self.path and math.hypot(self.path[0][0] - self.robot.x,
+                                    self.path[0][1] - self.robot.z) < WP_TOL:
             self.path.pop(0)
-            seg_i -= 1
+            self.render_path()
 
-        a, b = self.path[seg_i], self.path[seg_i + 1]
-        proj = Vec3(a.x + (b.x - a.x) * seg_t, 0, a.z + (b.z - a.z) * seg_t)
-        # 从投影点沿路径累计 LOOKAHEAD
-        target = self._lookahead_point(seg_i, seg_t, LOOKAHEAD)
-
-        dx, dz = target.x - self.robot_pos.x, target.z - self.robot_pos.z
-        ang = (math.degrees(math.atan2(dx, dz)) - self.robot_heading + 180) % 360 - 180
-
-        if abs(ang) > 100:
-            self.robot_state = '原地转向'
-            v = 0.0
-        elif abs(ang) > 18:
-            self.robot_state = '转向行进'
-            v = ROBOT_SPEED * max(.25, 1 - abs(ang) / 110)
-        else:
-            self.robot_state = '自主行进'
-            v = ROBOT_SPEED
-
-        self.robot_heading += clamp(ang, -ROBOT_OMEGA * dt, ROBOT_OMEGA * dt)
-
-        if v > 0 and abs(ang) < 75:
-            step = v * dt
-            hd = math.radians(self.robot_heading)
-            self.robot_pos.x += math.sin(hd) * step
-            self.robot_pos.z += math.cos(hd) * step
-            self.odom += step
-            self.current_speed = v
-            for w in self.robot.wheels:
-                w.rotation_x -= math.degrees(step / .145)
-            self._trail_acc += step
-            if self._trail_acc >= TRAIL_SPACING:
-                self._add_trail()
-                self._trail_acc = 0.0
-            self.refresh_path_markers()
-        else:
-            self.current_speed = 0.0
-
-        self.robot.position = self.robot_pos
-        self.robot.rotation_y = self.robot_heading
-
-    def _nearest_path_info(self):
-        """返回 (最近段索引, 段内参数 t, 平方距离)。"""
-        rx, rz = self.robot_pos.x, self.robot_pos.z
-        best = (0, 0.0, 1e18)
-        for i in range(len(self.path) - 1):
-            a, b = self.path[i], self.path[i + 1]
-            dx, dz = b.x - a.x, b.z - a.z
-            l2 = dx * dx + dz * dz
-            t = 0.0 if l2 < 1e-9 else clamp(((rx - a.x) * dx + (rz - a.z) * dz) / l2, 0, 1)
-            d2 = (a.x + dx * t - rx) ** 2 + (a.z + dz * t - rz) ** 2
-            if d2 < best[2]:
-                best = (i, t, d2)
-        return best
-
-    def _lookahead_point(self, seg_i, seg_t, lookahead):
-        """从 (seg_i, seg_t) 沿路径累计 lookahead 米，插值返回前视点。"""
-        a, b = self.path[seg_i], self.path[seg_i + 1]
-        remain = (1 - seg_t) * math.hypot(b.x - a.x, b.z - a.z)
-        if remain >= lookahead:
-            tt = seg_t + lookahead / max(math.hypot(b.x - a.x, b.z - a.z), 1e-9)
-            return Vec3(a.x + (b.x - a.x) * tt, 0, a.z + (b.z - a.z) * tt)
-        need = lookahead - remain
-        j = seg_i + 1
-        while j < len(self.path) - 1:
-            seg_len = math.hypot(self.path[j + 1].x - self.path[j].x,
-                                 self.path[j + 1].z - self.path[j].z)
-            if seg_len >= need:
-                t = need / max(seg_len, 1e-9)
-                return Vec3(self.path[j].x + (self.path[j + 1].x - self.path[j].x) * t,
-                            0,
-                            self.path[j].z + (self.path[j + 1].z - self.path[j].z) * t)
-            need -= seg_len
-            j += 1
-        return Vec3(self.path[-1].x, 0, self.path[-1].z)
-
-    def _add_trail(self):
-        m = self.trail_markers[len(self.trail_ring) % TRAIL_MAX]
-        m.enabled = True
-        m.position = Vec3(self.robot_pos.x, .025, self.robot_pos.z)
-        self.trail_ring.append(m)
-
-    # ---------------- 鼠标拾取 ----------------
-    def _mouse_over_ui(self):
-        ent = mouse.hovered_entity
-        while ent is not None:
-            if isinstance(ent, Button):
-                return True
-            ent = ent.parent
-        return False
-
-    def _ground_hit(self):
-        """返回 (world_point, obstacle_root_entity) 或 (None, None)。"""
-        if mouse.hovered_entity is None or mouse.world_point is None:
-            return None, None
-        ent = mouse.hovered_entity
-        p = mouse.world_point
-        if ent == self.floor:
-            return Vec3(p.x, 0, p.z), None
-        root = ent
-        while root is not None and not hasattr(root, 'ob_id'):
-            root = root.parent
-        if root is not None:
-            return Vec3(p.x, 0, p.z), root
-        return None, None
-
-    def handle_click(self, point, ob):
-        if self.mode == 'target':
-            if ob is not None:
-                self.flash('请点击空闲地面设置目标点')
-            else:
-                self.set_goal(point)
-        elif self.mode in ('add_rack', 'add_mix'):
-            self.add_obstacle_at(self.add_kind,
-                                 self.planner.world_to_cell(point), self.add_rot)
-        else:  # delete
-            if ob is not None:
-                self.remove_obstacle(ob.ob_id)
-            else:
-                self.flash('请点击要删除的障碍物')
-
-    def handle_paint(self, dt):
-        self._paint_cd -= dt
-        if self._paint_cd > 0 or not self._dragging['left']:
-            return
-        if self.mode == 'target' or self._mouse_over_ui():
-            return
-        p, ob = self._ground_hit()
-        if p is None:
-            return
-        if self.mode == 'delete':
-            if ob is not None:
-                self.remove_obstacle(ob.ob_id, quiet=True)
-                self._paint_cd = .15
-        else:
-            if self.add_obstacle_at(self.add_kind,
-                                    self.planner.world_to_cell(p),
-                                    self.add_rot, quiet=True):
-                self._paint_cd = .22
-
-    def _update_preview(self):
-        tiles = self.preview_tiles
-        if self.mode not in ('add_rack', 'add_mix') or self._mouse_over_ui():
-            self.preview.enabled = False
-            return
-        p, _ = self._ground_hit()
-        if p is None:
-            self.preview.enabled = False
-            return
-        cx, cz = self.planner.world_to_cell(p)
-        nx, nz = OB_TYPES[self.add_kind]['footprint']
-        cells = footprint_cells(cx, cz, nx, nz, self.add_rot)
-        ok = (not any(not self.planner.in_bounds(x, z) for x, z in cells)
-              and not any(self.planner.base[x][z] for x, z in cells))
-        col = color.rgba32(90, 230, 120, 110) if ok else color.rgba32(240, 80, 80, 110)
-        for i, t in enumerate(tiles):
-            if i < len(cells):
-                x, z = cells[i]
-                t.enabled = True
-                t.position = Vec3(x - GRID_W / 2 + .5, .02, z - GRID_H / 2 + .5)
-                t.color = col
-            else:
-                t.enabled = False
-        self.preview.enabled = True
-
-    # ---------------- UI ----------------
-    def _build_ui(self):
-        # 顶部 / 底部半透明条
-        Entity(parent=camera.ui, model='quad',
-               color=color.rgba32(15, 25, 40, 210),
-               position=(0, .462, 1), scale=(1.06, .085))
-        Entity(parent=camera.ui, model='quad',
-               color=color.rgba32(15, 25, 40, 210),
-               position=(0, -.462, 1), scale=(1.06, .075))
-        # HUD 底板（左上）
-        Entity(parent=camera.ui, model='quad',
-               color=color.rgba32(15, 25, 40, 190),
-               position=(-.635, .33, 1), scale=(.30, .235))
-        self.hud = apply_cjk(Text(
-            text='',
-            position=window.top_left + Vec3(.02, -.125, -1),
-            scale=.78), '')
-
-        btns = [
-            ('target',  '目标[1]'),
-            ('add_rack', '货架[2]'),
-            ('add_mix',  '集装箱/设备/围栏[3]'),
-            ('delete',   '删除[4]'),
-        ]
-        self.mode_buttons = {}
-        widths = (.09, .09, .205, .09)
-        gap = .012
-        total = sum(widths) + gap * (len(widths) - 1)
-        x = -total / 2
-        for (m, label), w in zip(btns, widths):
-            b = Button(parent=camera.ui, text=label,
-                       position=(x + w / 2, .462),
-                       scale=(w, .055), color=color.hsv(210, .3, .35, .95),
-                       text_color=color.white)
-            apply_cjk(b.text_entity, label)
-            b.text_entity.scale *= .82
-            if m == 'add_mix':
-                b.on_click = self._cycle_mix
-            else:
-                b.on_click = lambda m=m: self.set_mode(m)
-            self.mode_buttons[m] = b
-            x += w + gap
-
-        actions = [
-            ('rotate',  'F 旋转'),
-            ('pause',   '空格 暂停'),
-            ('restart', 'R 重置'),
-            ('random',  'N 随机场景'),
-        ]
-        widths2 = (.09, .11, .10, .13)
-        total2 = sum(widths2) + gap * 3
-        x = -total2 / 2
-        for (act, label), w in zip(actions, widths2):
-            b = Button(parent=camera.ui, text=label,
-                       position=(x + w / 2, -.462),
-                       scale=(w, .05), color=color.hsv(220, .25, .3, .95),
-                       text_color=color.white)
-            apply_cjk(b.text_entity, label)
-            b.text_entity.scale *= .82
-            b.on_click = lambda act=act: self.do_action(act)
-            x += w + gap
-
-        apply_cjk(Text(text='',
-                       position=window.bottom_right + Vec3(-.012, -.448, -1),
-                       origin=(.7, 0), scale=.62, color=color.hsv(210, .1, .82)),
-                  '左键：当前模式操作（可拖拽）　右键拖拽：旋转视角　滚轮：缩放')
-        self.msg_text = apply_cjk(Text(text='',
-                                       position=window.top_right + Vec3(-.02, -.11, -1),
-                                       origin=(.7, .5), scale=.85,
-                                       color=color.yellow), '')
-
-    def do_action(self, act):
-        if act == 'rotate':
-            self.add_rot = 0 if self.add_rot == 90 else 90
-            self.flash(f'障碍朝向: {self.add_rot}°')
-        elif act == 'pause':
-            self.paused = not self.paused
-            self.flash('已暂停' if self.paused else '继续运行')
-        elif act == 'restart':
-            self.restart()
-        elif act == 'random':
-            self.randomize_scene()
-
-    def _cycle_mix(self):
-        cycle = ['container', 'equip', 'fence']
-        if self.mode != 'add_mix' or self.add_kind not in cycle:
-            self.set_mode('add_mix')
-            self.add_kind = 'container'
-        else:
-            self.add_kind = cycle[(cycle.index(self.add_kind) + 1) % 3]
-            self.flash(f'添加类型: {OB_TYPES[self.add_kind]["name"]}')
-
-    def set_mode(self, mode):
-        self.mode = mode
-        if mode == 'add_mix' and self.add_kind not in ('container', 'equip', 'fence'):
-            self.add_kind = 'container'
-        elif mode == 'add_rack':
-            self.add_kind = 'rack'
-        for m, b in self.mode_buttons.items():
-            b.color = (color.hsv(190, .7, .5, .95) if m == mode
-                       else color.hsv(210, .3, .35, .92))
-
-    def flash(self, msg):
-        self.message_text = msg
-        self.message_until = u_time.time() + 2.6
-
-    def restart(self):
-        self.robot_pos = Vec3(self.start_pos.x, 0, self.start_pos.z)
-        self.robot_heading = 0.0
-        self.robot.position = self.robot_pos
-        self.robot.rotation_y = 0
-        self.odom = 0.0
-        self.replan_count = 0
-        self.trail_ring.clear()
-        for m in self.trail_markers:
-            m.enabled = False
-        self.paused = False
-        self._replan(count=False)
-        self.flash('机器人已重置到起点')
-
-    # ---------------- 相机 ----------------
-    def _update_camera(self):
-        t = Vec3(self.robot_pos.x, 0, self.robot_pos.z)
-        yaw, pitch = math.radians(self._orbit_yaw), math.radians(self._orbit_pitch)
-        d = self._cam_dist
-        camera.world_position = (
-            t.x + d * math.cos(pitch) * math.sin(yaw),
-            t.y + d * math.sin(pitch) + 1.0,
-            t.z + d * math.cos(pitch) * math.cos(yaw),
-        )
-        camera.look_at(t + Vec3(0, .4, 0))
-
-    # ---------------- HUD ----------------
-    def _update_hud(self):
-        path_len = 0.0
-        if self.path:
-            chain = [Vec3(self.robot_pos.x, 0, self.robot_pos.z)] + self.path
-            for i in range(len(chain) - 1):
-                path_len += math.hypot(chain[i + 1].x - chain[i].x,
-                                       chain[i + 1].z - chain[i].z)
-        state_cn = {'已到达': '已到达 ✓', '受阻·重规划中': '受阻·重规划中 !'}.get(
-            self.robot_state, self.robot_state)
-        pause_cn = '已暂停' if self.paused else '运行中'
-        kind_name = OB_TYPES.get(self.add_kind, {}).get('name', '')
-        mode_cn = {'target': '设置目标点', 'delete': '删除障碍',
-                   'add_rack': f'添加货架（朝向 {self.add_rot}°）',
-                   'add_mix': f'添加{kind_name}（朝向 {self.add_rot}°）'}[self.mode]
-        self.hud.text = (
-            '仓储 AGV 路径规划仿真\n'
-            f'状态: {state_cn}    [{pause_cn}]\n'
-            f'模式: {mode_cn}\n'
-            f'规划路径长度: {path_len:6.2f} m\n'
-            f'剩余距离:     {path_len:6.2f} m\n'
-            f'行驶里程:     {self.odom:6.2f} m\n'
-            f'当前速度:     {self.current_speed:5.2f} m/s\n'
-            f'重新规划次数: {self.replan_count}'
-        )
-        self.msg_text.text = (self.message_text
-                              if u_time.time() < self.message_until else '')
-
-    # ---------------- Ursina 回调 ----------------
-    def update(self):
-        dt = clamp(u_time.dt, .0001, .05)
-        self._update_camera()
-
-        pulse = .85 + .25 * math.sin(u_time.time() * 5)
-        self.goal_marker.beam.color = color.rgba32(255, int(70 * pulse),
-                                                 int(70 * pulse), 60)
-        self.robot.scan_bar.rotation_y = (u_time.time() * 240) % 360
-
-        if not self.paused:
-            self._check_acc += dt
-            if self._check_acc >= PATH_CHECK_INTERVAL:
-                self._check_acc = 0.0
-                if self.path_ahead_blocked():
-                    self._replan()
-            self.update_robot(dt)
-
-        st = self.robot_state
-        bc = {'已到达': color.lime,
-              '受阻·重规划中': color.orange,
-              '规划中': color.azure}.get(st, color.green)
-        blink = st in ('受阻·重规划中', '规划中') and math.sin(u_time.time() * 12) > 0
-        self.robot.beacon.color = color.dark_gray if blink else bc
-
-        self.handle_paint(dt)
-        self._update_preview()
+        # ---- 行驶轨迹 ----
+        if self.speed > 0.05:
+            if not self.trail or math.hypot(self.trail[-1][0] - self.robot.x,
+                                            self.trail[-1][1] - self.robot.z) \
+                    > 0.22:
+                self.add_trail_point((self.robot.x, self.robot.z))
+            self.status = '前往目标'
         self._update_hud()
-        if self.smoke:
-            self.smoke_frames += 1
-            if self.smoke_frames == 150:
-                self.set_mode('add_mix')
-                self.add_kind = 'fence'
-            elif self.smoke_frames == 400:
-                self.randomize_scene()
-            elif self.smoke_frames > 750:
-                print('SMOKE_OK')
-                application.quit()
-        if self.shot:
-            self.smoke_frames += 1
-            if self.smoke_frames in (120, 300):
-                i = 0 if self.smoke_frames == 120 else 1
-                self._app.screenshot(
-                    os.path.abspath(f'agv_shot{i}.png'), defaultFilename=False)
-                print(f'SHOT{i}_OK')
-            if self.smoke_frames > 360:
-                application.quit()
 
-    def input(self, key):
-        if key == 'left mouse down':
-            self._dragging['left'] = True
-            self._left_down_pos = (mouse.position[0], mouse.position[1])
-            self._left_moved = False
-        elif key == 'left mouse up':
-            was_drag = self._dragging['left']
-            self._dragging['left'] = False
-            if was_drag and not self._left_moved and not self._mouse_over_ui():
-                p, ob = self._ground_hit()
-                if p is not None:
-                    self.handle_click(p, ob)
-        elif key == 'right mouse down':
-            self._dragging['right'] = True
-        elif key == 'right mouse up':
-            self._dragging['right'] = False
-        elif key == 'mouse moved':
-            if self._dragging['left']:
-                x0, y0 = self._left_down_pos
-                if math.hypot(mouse.position[0] - x0,
-                              mouse.position[1] - y0) > .012:
-                    self._left_moved = True
-            if self._dragging['right']:
-                v = mouse.velocity
-                self._orbit_yaw += v[0] * 90
-                self._orbit_pitch = clamp(self._orbit_pitch - v[1] * 70, 22, 82)
-        elif key == 'scroll up':
-            self._cam_dist = clamp(self._cam_dist - 2.2, 7, 55)
-        elif key == 'scroll down':
-            self._cam_dist = clamp(self._cam_dist + 2.2, 7, 55)
-        elif key == '1':
-            self.set_mode('target')
-        elif key == '2':
-            self.set_mode('add_rack')
-        elif key == '3':
-            # 重复按 3 在集装箱/设备箱/围栏之间循环
-            cycle = ['container', 'equip', 'fence']
-            if self.mode != 'add_mix' or self.add_kind not in cycle:
-                self.set_mode('add_mix')
-                self.add_kind = 'container'
+    def _lookahead_blocked(self) -> bool:
+        """检测规划路径前方 1.4m 内的线段是否被新障碍阻塞。
+
+        沿路径点依次累加距离，只检测路径实际覆盖到的范围；
+        剩余路径不足 1.4m 时就只检测到终点，绝不向终点之外外推
+        （终点在围栏边时外推会探到边界安全带而误判阻塞）。
+        """
+        if not self.path:
+            return False
+        p0 = (self.robot.x, self.robot.z)
+        probe_d = 1.4
+        prev = p0
+        covered = 0.0
+        for pt in self.path:
+            seg = math.hypot(pt[0] - prev[0], pt[1] - prev[1])
+            if covered + seg >= probe_d:
+                t = (probe_d - covered) / seg if seg > 1e-9 else 0.0
+                probe = (prev[0] + (pt[0] - prev[0]) * t,
+                         prev[1] + (pt[1] - prev[1]) * t)
+                return self.world.segment_blocked(prev, probe) \
+                    or self.world.segment_blocked(p0, prev)
+            if self.world.segment_blocked(prev, pt):
+                return True
+            covered += seg
+            prev = pt
+        return False  # 整条剩余路径短于 1.4m 且全部畅通
+
+    def _roll_wheels(self, dt: float) -> None:
+        # 车轮半径 0.20，按 v/r 绕车轴（枢轴 X 轴）滚动
+        ang = math.degrees(self.speed * dt / 0.20)
+        for w_ in self.wheels:
+            w_.rotation_x += ang
+
+    # ========================== 重置 ==========================
+    def reset_robot(self, keep_goal: bool = True) -> None:
+        self.robot.position = (START_POS[0], 0, START_POS[1])
+        self.heading = 0.0
+        self.robot.rotation = (0, 0, 0)
+        self.speed = 0.0
+        self.path = []
+        self.clear_trail()
+        self.clear_path_viz()
+        self.replan_count = 0
+        self.status = '待机'
+        if not keep_goal:
+            self.goal_pos = None
+            self.goal_marker.enabled = False
+
+    def restart(self) -> None:
+        self.paused = False
+        self.reset_robot(keep_goal=True)
+        if self.goal_pos is not None:
+            self._recompute(count_replan=False)
+
+    def toggle_pause(self) -> None:
+        self.paused = not self.paused
+
+    def set_mode(self, m: str) -> None:
+        self.mode = m
+        self._refresh_mode_buttons()
+
+    def cycle_add_kind(self) -> None:
+        self.add_kind = KIND_ORDER[
+            (KIND_ORDER.index(self.add_kind) + 1) % len(KIND_ORDER)]
+        self.kind_text.text = f'添加类型：{self.add_kind}（Q 切换）'
+
+    # ========================== 状态灯 / HUD ==========================
+    def _set_status_light(self) -> None:
+        table = {
+            '前往目标': color.rgb32(60, 220, 130),
+            '已到达': color.rgb32(80, 235, 140),
+            '重新规划': color.rgb32(255, 190, 60),
+            '无可行路径': color.rgb32(235, 70, 70),
+            '暂停': color.rgb32(250, 220, 90),
+            '待机': color.cyan,
+        }
+        c = table.get(self.status, color.cyan)
+        if self.status in ('无可行路径', '重新规划') \
+                and int(u_time.time() * 4) % 2 == 0:
+            c = color.white
+        self.status_light.color = c
+
+    def _build_ui(self) -> None:
+        # 所有 UI 挂在一个位于原点的容器下：window 的宽高比自动修正只遍历
+        # parent 为 camera.ui 的直接子节点，容器 x=0 修正后不变，
+        # 内部元素坐标因此保持稳定。
+        ui_root = Entity(parent=camera.ui)
+        ui_root._is_ui = True
+        vx = 0.8  # ui 本地坐标水平可视半宽（世界半宽/ui缩放）
+
+        def mark(e: Entity) -> Entity:
+            e._is_ui = True
+            e.parent = ui_root
+            return e
+
+        panel_w = 0.275
+        panel_x = -vx + 0.02 + panel_w / 2
+        Entity(parent=ui_root, model='quad',
+               scale=(panel_w, 0.335), position=(panel_x, 0.285),
+               color=color.rgba32(28, 32, 40, 215))._is_ui = True
+        self.hud = Text(parent=ui_root,
+                        position=(-vx + 0.035, 0.43),
+                        scale=0.92, line_height=1.18,
+                        color=color.rgb32(235, 240, 248))
+        self.hud._is_ui = True
+        self.kind_text = Text(parent=ui_root, position=(0.0, -0.392),
+                              scale=0.8, color=color.rgb32(220, 226, 236),
+                              origin=(0, 0))
+        self.kind_text._is_ui = True
+        t1 = Text(parent=ui_root, position=(0, 0.472), origin=(0, 0),
+                  scale=1.05, text='智能仓储 AGV 路径规划仿真',
+                  color=color.rgb32(40, 50, 66))
+        t1._is_ui = True
+        t2 = Text(parent=ui_root, position=(0, 0.425), origin=(0, 0),
+                  scale=0.7,
+                  text='左键：当前模式操作    Tab/1/2/3：切换模式    Q：障碍类型\n'
+                       '空格：暂停/继续    R：重新开始    N：随机场景',
+                  color=color.rgb32(90, 100, 116))
+        t2._is_ui = True
+
+        # 底部按钮：在可视区内均匀排布
+        bw, bh, gap = 0.155, 0.065, 0.012
+        labels = [
+            ('目标点 (1)', MODE_TARGET, color.rgb32(70, 80, 96), 'mode'),
+            ('添加障碍 (2)', MODE_ADD, color.rgb32(70, 80, 96), 'mode'),
+            ('删除障碍 (3)', MODE_DELETE, color.rgb32(70, 80, 96), 'mode'),
+            ('暂停/继续', None, color.rgb32(58, 92, 84), 'act_pause'),
+            ('重新开始 R', None, color.rgb32(58, 92, 84), 'act_restart'),
+            ('随机场景 N', None, color.rgb32(58, 92, 84), 'act_random'),
+        ]
+        total = len(labels) * bw + (len(labels) - 1) * gap
+        x0 = -total / 2 + bw / 2
+        self.mode_buttons = {}
+        for i, (label, key, col, kind) in enumerate(labels):
+            bx = x0 + i * (bw + gap)
+            b = Button(parent=ui_root, text=label,
+                       scale=(bw, bh), position=(bx, -0.455),
+                       color=col,
+                       highlight_color=color.rgb32(110, 126, 146),
+                       text_size=0.78)
+            b._is_ui = True
+            b.text_entity.color = color.white
+            b.text_entity._is_ui = True
+            if kind == 'mode':
+                self.mode_buttons[key] = b
+            elif kind == 'act_pause':
+                b.on_click = self.toggle_pause
+            elif kind == 'act_restart':
+                b.on_click = self.restart
+            elif kind == 'act_random':
+                b.on_click = self.random_scene
+        self._refresh_mode_buttons()
+
+    def _refresh_mode_buttons(self) -> None:
+        for name, b in self.mode_buttons.items():
+            if name == self.mode:
+                b.color = color.rgb32(230, 150, 40)
+                b.highlight_color = color.rgb32(240, 170, 60)
             else:
-                self.add_kind = cycle[(cycle.index(self.add_kind) + 1) % 3]
-                self.flash(f'添加类型: {OB_TYPES[self.add_kind]["name"]}')
-        elif key == '4':
-            self.set_mode('delete')
-        elif key == 'f':
-            self.do_action('rotate')
+                b.color = color.rgb32(70, 80, 96)
+                b.highlight_color = color.rgb32(96, 110, 130)
+        if self.kind_text is not None:
+            self.kind_text.text = (f'添加类型：{self.add_kind}（Q 切换）'
+                                   if self.mode == MODE_ADD else '')
+
+    def _update_hud(self) -> None:
+        self._set_status_light()
+        if self.hud is None:
+            return
+        self.hud.text = (
+            f'状态：{self.status}\n'
+            f'速度：{self.speed:5.2f} m/s\n'
+            f'路径长度：{path_length(self.path):7.2f} m\n'
+            f'剩余距离：{self.remaining_distance():7.2f} m\n'
+            f'重新规划次数：{self.replan_count}\n'
+            f'当前模式：{self.mode}\n'
+            f'障碍数量：{len(self.obstacles)}'
+        )
+
+    def input(self, key: str) -> None:
+        if key == 'left mouse down':
+            self.on_click()
+        elif key == 'tab':
+            order = [MODE_TARGET, MODE_ADD, MODE_DELETE]
+            self.set_mode(order[(order.index(self.mode) + 1) % 3])
+        elif key == '1':
+            self.set_mode(MODE_TARGET)
+        elif key == '2':
+            self.set_mode(MODE_ADD)
+        elif key == '3':
+            self.set_mode(MODE_DELETE)
+        elif key == 'q':
+            self.cycle_add_kind()
         elif key == 'space':
-            self.do_action('pause')
+            self.toggle_pause()
         elif key == 'r':
             self.restart()
         elif key == 'n':
-            self.randomize_scene()
+            self.random_scene()
+        elif key == 'escape':
+            application.quit()
 
 
-# ----------------------------------------------------------------------
-# 无头自检
-# ----------------------------------------------------------------------
-def selftest():
-    random.seed(42)
-    print('=== AGV 仿真无头自检 ===')
-    planner = GridPlanner()
-    start = planner.cell_to_world(START_CELL)
-    goal = planner.cell_to_world(GOAL_CELL)
+def time_dt() -> float:
+    return float(u_time.dt)
 
-    # 1) 空场景 A*
-    path = planner.plan_world(start, goal)
-    assert path, '空场景必须能规划出路径'
-    L0 = sum(math.hypot(path[i+1].x - path[i].x, path[i+1].z - path[i].z)
-             for i in range(len(path) - 1))
-    print(f'[1] 空场景 A*: {len(path)} 个航点, 长度 {L0:.2f} m')
-
-    # 2) 横墙留缺口（膨胀半径 1，缺口至少 3 格宽）
-    wall_x = (START_CELL[0] + GOAL_CELL[0]) // 2
-    gap = (11, 12, 13)
-    for z in range(GRID_H):
-        if z not in gap:
-            planner.add_base_cells([(wall_x, z)])
-    path2 = planner.plan_world(start, goal)
-    assert path2, '留缺口的墙必须可通行'
-    near = [wp for wp in path2
-            if 10.0 <= wp.z + GRID_H / 2 <= 14.0
-            and abs(wp.x - (wall_x - GRID_W / 2 + .5)) <= 1.0]
-    assert near, '路径必须从缺口附近通过'
-    print(f'[2] 绕墙路径: {len(path2)} 航点, 从缺口 z=11~13 通过 ✓')
-
-    # 3) 完全封死 -> 无路径
-    for gz in gap:
-        planner.add_base_cells([(wall_x, gz)])
-    assert not planner.plan_world(start, goal), '完全封墙应无路径'
-    for gz in gap:
-        planner.remove_base_cells([(wall_x, gz)])
-    assert planner.plan_world(start, goal), '解封后应恢复'
-    print('[3] 完全封死无路径 / 解封恢复 ✓')
-
-    # 4) 膨胀 3×3
-    planner2 = GridPlanner(inflate=1)
-    planner2.add_base_cells([(20, 15)])
-    assert planner2.blocked[20][15] and planner2.blocked[21][15] \
-        and planner2.blocked[20][16] and planner2.blocked[19][14]
-    assert not planner2.base[21][15]
-    print('[4] 障碍膨胀 3×3 ✓')
-
-    # 5) 随机场景连通性（模拟 GUI 的生成 + 连通性校验策略）
-    for seed in range(20):
-        random.seed(seed)
-        p3 = GridPlanner()
-
-        def place(kind, cx, cz, rot):
-            nx, nz = OB_TYPES[kind]['footprint']
-            cells = footprint_cells(cx, cz, nx, nz, rot)
-            if any(not p3.in_bounds(x, z) for x, z in cells):
-                return False
-            if any(p3.base[x][z] for x, z in cells):
-                return False
-            p3.add_base_cells(cells)
-            if not p3.plan_world(start, goal):
-                p3.remove_base_cells(cells)
-                return False
-            return True
-
-        nobs = 0
-        for rz in (8, 21):
-            for cx in range(6, GRID_W - 6, 5):
-                if place('rack', cx, rz + random.choice((-1, 0, 1)), 0):
-                    nobs += 1
-        for _ in range(30):
-            k = random.choice(['container', 'equip', 'fence'])
-            if place(k, random.randrange(3, GRID_W - 3),
-                     random.randrange(3, GRID_H - 3), random.choice((0, 90))):
-                nobs += 1
-        final = p3.plan_world(start, goal)
-        assert final and nobs >= 15, f'seed {seed}: 场景无效 nobs={nobs}'
-    print('[5] 20 个随机场景全部连通且障碍数充足 ✓')
-
-    # 6) 纯追踪收敛
-    pos = Vec3(start.x, 0, start.z)
-    heading = 0.0
-    dt = 1 / 60
-    for _ in range(60 * 30):
-        ang = math.degrees(math.atan2(goal.x - pos.x, goal.z - pos.z)) - heading
-        ang = (ang + 180) % 360 - 180
-        heading += clamp(ang, -ROBOT_OMEGA * dt, ROBOT_OMEGA * dt)
-        if abs(ang) < 75:
-            pos.x += math.sin(math.radians(heading)) * ROBOT_SPEED * dt
-            pos.z += math.cos(math.radians(heading)) * ROBOT_SPEED * dt
-        if math.hypot(goal.x - pos.x, goal.z - pos.z) < ARRIVE_DIST:
-            break
-    err = math.hypot(goal.x - pos.x, goal.z - pos.z)
-    assert err < ARRIVE_DIST + .05, f'纯追踪未收敛: err={err:.2f}'
-    print(f'[6] 纯追踪运动学收敛, 终点误差 {err:.3f} m ✓')
-
-    print('=== 全部自检通过 ===')
-
-
-# ----------------------------------------------------------------------
-# 入口
-# ----------------------------------------------------------------------
-def main():
-    if '--selftest' in sys.argv:
-        selftest()
-        return
-
-    # 限制帧率：无 vsync 环境下避免突发渲染导致的画面卡顿
-    from panda3d.core import loadPrcFileData
-    loadPrcFileData('', 'sync-video 0')
-    loadPrcFileData('', 'clock-mode limited')
-    loadPrcFileData('', 'clock-frame-rate 60')
-    if '--windowed' in sys.argv:
-        loadPrcFileData('', 'win-size 1400 900')
-        loadPrcFileData('', 'fullscreen 0')
-
-    smoke = '--smoke' in sys.argv
-    shot = '--shot' in sys.argv
-    app = Ursina(title='仓储 AGV 3D 路径规划仿真', borderless=False,
-                 development_mode=False, fullscreen='--windowed' not in sys.argv)
-    if '--windowed' in sys.argv:
-        window.borderless = False
-    window.color = color.hsv(212, .22, .92)
-    window.fps_counter.enabled = False
-    window.exit_button.visible = False
-
-    sim = AGVSimulation(smoke=smoke, shot=shot)
-    sim._app = app
-    app.run()
-
-
+# ========================== 入口 ==========================
 if __name__ == '__main__':
-    main()
+    sim: Optional[AGVSimulation] = None
+
+    def update() -> None:
+        sim.update()
+
+    def input(key: str) -> None:
+        sim.input(key)
+
+    sim = AGVSimulation()
+
+    if os.environ.get('AGV_SMOKE'):
+        # 无窗口自测：步进若干帧，在规划路径前方放置挡路障碍，
+        # 验证真实运动、碰撞拦截与自动重规划
+        task_mgr = sim.app.taskMgr
+        start_pos = (sim.robot.x, sim.robot.z)
+        blocked_at = None
+        frames = int(os.environ.get('AGV_SMOKE', '600'))
+        for i in range(frames):
+            task_mgr.step()
+            if i == 120 and sim.status == '前往目标' and len(sim.path) >= 2:
+                # 沿当前规划路径前方 ~6m 处取点，放置一个合法且能挡住路径的箱子
+                cum = 0.0
+                bp = sim.path[0]
+                for a, b in zip(sim.path, sim.path[1:]):
+                    seg = math.hypot(b[0] - a[0], b[1] - a[1])
+                    if cum + seg >= 6.0:
+                        t = (6.0 - cum) / seg
+                        bp = (a[0] + (b[0] - a[0]) * t,
+                              a[1] + (b[1] - a[1]) * t)
+                        break
+                    cum += seg
+                    bp = b
+                # 设备箱较窄，是 _can_place 允许且足以阻断单条路径的障碍
+                if sim.add_obstacle('设备箱', bp[0], bp[1]):
+                    blocked_at = bp
+        moved = math.hypot(sim.robot.x - start_pos[0],
+                           sim.robot.z - start_pos[1])
+        print(f'[smoke] moved={moved:.2f}m replans={sim.replan_count} '
+              f'status={sim.status} trail_pts={len(sim.trail)} '
+              f'pos=({sim.robot.x:.1f},{sim.robot.z:.1f}) '
+              f'block_at={blocked_at and tuple(round(v,1) for v in blocked_at)}')
+        assert blocked_at is not None, '未能在路径上放置障碍'
+        assert moved > 5.0, '机器人没有真实移动'
+        assert sim.replan_count >= 1, '阻断后未触发重新规划'
+        assert sim.status in ('前往目标', '已到达'), '最终状态异常'
+        print('[smoke] PASS')
+        sys.exit(0)
+
+    sim.app.run()
